@@ -1,0 +1,589 @@
+// Set your Mapbox access token
+mapboxgl.accessToken = 'pk.eyJ1Ijoic3ViaG95YSIsImEiOiJjbWh6eTl4N3gwczVtMm1vc3FxNW9memMxIn0.uhExl0jAlzM8pYQKmoTJ5A';
+
+// Initialize map
+const map = new mapboxgl.Map({
+  container: 'map',
+  style: 'mapbox://styles/mapbox/streets-v12',
+  center: [-71.0589, 42.3601], // Boston coordinates
+  zoom: 12
+});
+
+// Global variables
+let originalStations = []; // Original station data from API
+let stations = []; // Stations with traffic data
+let trips = [];
+let departuresByMinute = [];
+let arrivalsByMinute = [];
+let svg;
+let g;
+let stationFlow;
+let sizeScale;
+
+// Wait for map to load
+map.on('load', async () => {
+  console.log('Map loaded successfully');
+  
+  try {
+    // Step 2: Add bike lanes
+    await addBikeLanes();
+    
+    // Step 3: Set up SVG overlay (do this early so it's ready)
+    setupSVGOverlay();
+    
+    // Step 3 & 4: Load stations and traffic data
+    await loadStationsAndTraffic();
+    
+    // Step 4: Initial scatter plot (only if data loaded successfully)
+    if (originalStations && originalStations.length > 0 && trips.length > 0) {
+      console.log('Ready to draw circles. Stations:', originalStations.length, 'Trips:', trips.length);
+      // Wait a bit for map to fully render, then draw circles
+      setTimeout(() => {
+        console.log('Calling updateScatterPlot...');
+        updateScatterPlot(-1);
+      }, 1000);
+    } else {
+      console.error('Missing data:', {
+        stations: originalStations.length,
+        trips: trips.length
+      });
+    }
+    
+    // Step 5: Set up time filter
+    setupTimeFilter();
+    
+    console.log('All initialization complete!');
+  } catch (error) {
+    console.error('Error during initialization:', error);
+    alert('초기화 중 오류가 발생했습니다: ' + error.message);
+  }
+});
+
+// Add error handler for map
+map.on('error', (e) => {
+  console.error('Map error:', e);
+  if (e.error && e.error.message) {
+    alert('지도 오류: ' + e.error.message);
+  }
+});
+
+// Step 2: Add bike lanes from GeoJSON
+async function addBikeLanes() {
+  try {
+    console.log('Loading bike lanes from GeoJSON...');
+    const response = await fetch('Existing_Bike_Network_2022.geojson');
+    if (!response.ok) {
+      throw new Error(`Failed to fetch GeoJSON: ${response.status}`);
+    }
+    const bikeNetwork = await response.json();
+    console.log('GeoJSON loaded:', bikeNetwork.features?.length || 0, 'features');
+    
+    // Add Boston bike lanes
+    map.addSource('bike-lanes', {
+      type: 'geojson',
+      data: bikeNetwork
+    });
+    
+    map.addLayer({
+      id: 'bike-lanes',
+      type: 'line',
+      source: 'bike-lanes',
+      paint: {
+        'line-color': '#4CAF50',
+        'line-width': 3,
+        'line-opacity': 0.7
+      }
+    });
+    
+    console.log('Bike lanes added successfully');
+  } catch (error) {
+    console.error('Error loading bike lanes:', error);
+    // Don't block the rest of the app if bike lanes fail to load
+  }
+}
+
+// Step 3 & 4: Load stations and traffic data
+async function loadStationsAndTraffic() {
+  try {
+    console.log('Loading station data from BlueBikes API...');
+    // Fetch station data from BlueBikes API
+    const stationsResponse = await fetch('https://gbfs.bluebikes.com/gbfs/en/station_information.json');
+    if (!stationsResponse.ok) {
+      throw new Error(`Failed to fetch stations: ${stationsResponse.status}`);
+    }
+    const stationsData = await stationsResponse.json();
+    console.log('Station data loaded:', stationsData.data.stations.length, 'stations');
+    
+    console.log('Loading CSV traffic data...');
+    // Parse CSV traffic data
+    const csvResponse = await fetch('bluebikes-traffic-2024-03.csv');
+    if (!csvResponse.ok) {
+      throw new Error(`Failed to fetch CSV: ${csvResponse.status}`);
+    }
+    const csvText = await csvResponse.text();
+    trips = d3.csvParse(csvText);
+    console.log('CSV data loaded:', trips.length, 'trips');
+    
+    // Store original station data
+    originalStations = stationsData.data.stations;
+    
+    if (originalStations.length === 0) {
+      throw new Error('No stations found in API response');
+    }
+    
+    if (trips.length === 0) {
+      throw new Error('No trips found in CSV data');
+    }
+    
+    // Process trips by minute
+    processTripsByMinute();
+    console.log('Trips processed by minute');
+    
+    // Calculate initial station traffic
+    stations = computeStationTraffic(originalStations);
+    console.log('Stations and traffic data loaded successfully');
+  } catch (error) {
+    console.error('Error loading stations and traffic:', error);
+    alert('데이터 로딩 중 오류가 발생했습니다. 브라우저 콘솔을 확인하세요.\nError: ' + error.message);
+  }
+}
+
+// Process trips by minute for efficient filtering
+function processTripsByMinute() {
+  // Group departures by minute
+  departuresByMinute = Array(1440).fill(null).map(() => []);
+  trips.forEach(trip => {
+    const startTime = new Date(trip.started_at);
+    const minutes = startTime.getHours() * 60 + startTime.getMinutes();
+    departuresByMinute[minutes].push(trip);
+  });
+  
+  // Group arrivals by minute
+  arrivalsByMinute = Array(1440).fill(null).map(() => []);
+  trips.forEach(trip => {
+    const endTime = new Date(trip.ended_at);
+    const minutes = endTime.getHours() * 60 + endTime.getMinutes();
+    arrivalsByMinute[minutes].push(trip);
+  });
+}
+
+// Filter trips by time range (efficient version)
+function filterByMinute(tripsByMinute, timeFilter) {
+  if (timeFilter === -1) {
+    return tripsByMinute.flat();
+  }
+  
+  const [minMinute, maxMinute] = timeFilter;
+  
+  if (minMinute > maxMinute) {
+    // Handle wrap-around (e.g., 22:00 to 02:00)
+    const beforeMidnight = tripsByMinute.slice(minMinute);
+    const afterMidnight = tripsByMinute.slice(0, maxMinute);
+    return beforeMidnight.concat(afterMidnight).flat();
+  } else {
+    return tripsByMinute.slice(minMinute, maxMinute).flat();
+  }
+}
+
+// Compute station traffic
+function computeStationTraffic(stationData, timeFilter = -1) {
+  // Retrieve filtered trips efficiently
+  const departures = d3.rollup(
+    filterByMinute(departuresByMinute, timeFilter),
+    (v) => v.length,
+    (d) => d.start_station_id
+  );
+
+  const arrivals = d3.rollup(
+    filterByMinute(arrivalsByMinute, timeFilter),
+    (v) => v.length,
+    (d) => d.end_station_id
+  );
+
+  // Update station data with filtered counts
+  return stationData.map((station) => {
+    const stationId = station.station_id;
+    const departuresCount = departures.get(stationId) || 0;
+    const arrivalsCount = arrivals.get(stationId) || 0;
+    const totalTraffic = departuresCount + arrivalsCount;
+    
+    return {
+      ...station,
+      departures: departuresCount,
+      arrivals: arrivalsCount,
+      totalTraffic: totalTraffic
+    };
+  });
+}
+
+// Step 3: Set up SVG overlay
+function setupSVGOverlay() {
+  const mapContainer = d3.select('#map');
+  
+  // Remove existing SVG if any
+  mapContainer.select('svg').remove();
+  
+  svg = mapContainer
+    .append('svg')
+    .attr('width', mapContainer.node().offsetWidth)
+    .attr('height', mapContainer.node().offsetHeight)
+    .style('position', 'absolute')
+    .style('top', 0)
+    .style('left', 0)
+    .style('pointer-events', 'none')
+    .style('z-index', 1000);
+  
+  g = svg.append('g');
+  
+  console.log('SVG overlay setup:', {
+    svgWidth: svg.attr('width'),
+    svgHeight: svg.attr('height'),
+    mapWidth: mapContainer.node().offsetWidth,
+    mapHeight: mapContainer.node().offsetHeight
+  });
+  
+}
+
+// Get projection function for converting lat/lon to pixel coordinates
+function getProjection() {
+  const bounds = map.getBounds();
+  const topLeft = bounds.getNorthWest();
+  const bottomRight = bounds.getSouthEast();
+  const canvas = map.getCanvas();
+  
+  if (!canvas || !canvas.offsetWidth || !canvas.offsetHeight) {
+    console.error('Map canvas not ready!');
+    return null;
+  }
+  
+  const width = canvas.offsetWidth;
+  const height = canvas.offsetHeight;
+  
+  const projection = d3.geoMercator()
+    .scale(1)
+    .translate([0, 0]);
+  
+  const path = d3.geoPath().projection(projection);
+  const b = path.bounds({ type: 'Point', coordinates: [topLeft.lng, topLeft.lat] });
+  
+  if (!b || b[0][0] === Infinity) {
+    console.error('Invalid bounds calculation');
+    return null;
+  }
+  
+  const s = 0.95 / Math.max(
+    (b[1][0] - b[0][0]) / width,
+    (b[1][1] - b[0][1]) / height
+  );
+  const t = [
+    (width - s * (b[1][0] + b[0][0])) / 2,
+    (height - s * (b[1][1] + b[0][1])) / 2
+  ];
+  
+  projection
+    .scale(s)
+    .translate(t);
+  
+  return projection;
+}
+
+// Step 4 & 6: Update scatter plot with traffic visualization
+function updateScatterPlot(timeFilter) {
+  if (!g) {
+    console.warn('SVG overlay not initialized yet');
+    return;
+  }
+  
+  if (!originalStations || originalStations.length === 0) {
+    console.warn('No station data available yet');
+    return;
+  }
+  
+  const filteredStations = computeStationTraffic(originalStations, timeFilter);
+  
+  // Filter out stations with no traffic, but also check for valid coordinates
+  const stationsWithTraffic = filteredStations.filter(s => {
+    const hasTraffic = true; // Show all stations
+    const hasCoords = s.lon != null && s.lat != null && !isNaN(s.lon) && !isNaN(s.lat);
+    return hasTraffic && hasCoords;
+  });
+  console.log('updateScatterPlot called:', {
+    timeFilter,
+    totalStations: filteredStations.length
+  });
+  
+  // Filter out stations with no traffic, but also check for valid coordinates
+  const stationsWithTraffic = filteredStations.filter(s => {
+    const hasCoords = s.lon != null && s.lat != null && !isNaN(s.lon) && !isNaN(s.lat);
+        console.error('Cannot get projection!');
+        return;
+      }
+      
+      const circles = g.selectAll('circle.station')
+        .data(allStations, d => d.station_id);
+      
+      circles.enter()
+        .append('circle')
+        .attr('class', 'station')
+        .attr('r', 8) // Fixed size for debugging
+        .style('pointer-events', 'all')
+        .style('fill', '#4682b4')
+        .style('opacity', 0.7)
+        .merge(circles)
+        .attr('cx', d => { if (!d || d.lon === undefined || d.lat === undefined) return -1000; const pos = projection([+d.lon, +d.lat]); if (!pos || isNaN(pos[0])) { console.warn('NaN cx for', d.name); return -1000; } return pos[0]; })
+        .attr('cy', d => {
+          const pos = projection([+d.lon, +d.lat]); if (!pos || isNaN(pos[0]) || isNaN(pos[1])) { console.warn('Invalid projection for station', d.name, d.lon, d.lat); return -1000; }
+          return pos[1];
+        });
+      
+      circles.exit().remove();
+      console.log('Drew', allStations.length, 'stations (all stations mode)');
+      return;
+    }
+    return;
+  }
+  
+  // Update size scale
+  const maxTraffic = d3.max(stationsWithTraffic, d => d.totalTraffic);
+  sizeScale = d3.scaleSqrt()
+    .domain([0, maxTraffic])
+    .range([3, 20]);
+  
+  // Update flow scale (Step 6)
+  stationFlow = d3.scaleQuantize()
+    .domain([0, 1])
+    .range([0, 0.5, 1]);
+  
+  // Get projection
+  const projection = getProjection();
+  
+  if (!projection) {
+    console.error('Failed to get projection!');
+  // Update size scale - use minimum size if no traffic
+  const maxTraffic = Math.max(1, d3.max(stationsWithTraffic, d => d.totalTraffic) || 1);
+  sizeScale = d3.scaleSqrt()
+  // Update size scale - use minimum size if no traffic
+  const maxTraffic = Math.max(1, d3.max(stationsWithTraffic, d => d.totalTraffic) || 1);
+  // Update size scale - use minimum size if no traffic
+  const maxTraffic = Math.max(1, d3.max(stationsWithTraffic, d => d.totalTraffic) || 1);
+  sizeScale = d3.scaleSqrt()
+    .domain([0, maxTraffic])
+    .range([5, 20]); // Minimum 5px even for 0 traffic      traffic: stationsWithTraffic[0].totalTraffic
+    });
+  }
+  
+  // Bind data to circles
+  const circles = g.selectAll('circle.station')
+    .data(stationsWithTraffic, d => d.station_id);
+  
+  // Add new circles
+  const circlesEnter = circles.enter()
+    .append('circle')
+    .attr('class', 'station')
+    .attr('r', 8) // Start with visible size
+    .style('pointer-events', 'all')
+    .style('fill', 'steelblue') // Fallback color
+    .style('opacity', 1.0).style('display', 'block')
+    .on('mouseenter', function(event, d) {
+      // Show tooltip
+      const tooltip = d3.select('body').append('div')
+        .attr('class', 'tooltip')
+        .style('opacity', 0)
+        .style('position', 'absolute')
+        .style('background', 'rgba(0, 0, 0, 0.8)')
+        .style('color', 'white')
+        .style('padding', '8px')
+        .style('border-radius', '4px')
+        .style('pointer-events', 'none')
+        .style('font-size', '12px')
+        .html(`
+          <strong>${d.name}</strong><br/>
+          Departures: ${d.departures}<br/>
+          Arrivals: ${d.arrivals}<br/>
+          Total: ${d.totalTraffic}
+        `);
+      
+      tooltip.transition()
+        .duration(200)
+        .style('opacity', 1);
+      
+      d3.select(this).style('stroke', 'white').style('stroke-width', 2);
+    })
+    .on('mousemove', function(event) {
+      d3.select('.tooltip')
+        .style('left', (event.pageX + 10) + 'px')
+        .style('top', (event.pageY - 10) + 'px');
+    })
+    .on('mouseleave', function() {
+      d3.select('.tooltip').remove();
+      d3.select(this).style('stroke', null).style('stroke-width', null);
+    });
+  // Update all circles
+  const allCircles = circles.merge(circlesEnter);
+  
+  console.log('Merged circles count:', allCircles.size());
+  
+  allCircles
+    .attr('cx', d => {
+      if (!d || d.lon === undefined || d.lat === undefined) return -1000;
+      const pos = projection([+d.lon, +d.lat]);
+      if (!pos || isNaN(pos[0])) { console.warn('NaN cx for', d.name, d.lon, d.lat); return -1000; }
+      return pos[0];
+    })
+    .attr('cy', d => {
+      if (!d || d.lon === undefined || d.lat === undefined) return -1000;
+      const pos = projection([+d.lon, +d.lat]);
+      if (!pos || isNaN(pos[1])) { console.warn('NaN cy for', d.name, d.lon, d.lat); return -1000; }
+      return pos[1];
+    })
+    .attr('r', d => {
+      const radius = d.totalTraffic > 0 ? sizeScale(d.totalTraffic) : 5;
+      return isNaN(radius) || radius < 5 ? 5 : radius;
+    })
+      const radius = sizeScale(d.totalTraffic);
+      return isNaN(radius) || radius < 3 ? 5 : radius;
+    })
+    .style('fill', d => {
+      if (d.totalTraffic === 0) return '#9370db'; // balanced
+      const ratio = d.departures / d.totalTraffic;
+      const flowValue = stationFlow(ratio);
+      
+      // Direct color assignment for better compatibility
+      if (flowValue === 1) return '#4682b4'; // more departures (steelblue)
+      if (flowValue === 0) return '#ff8c00'; // more arrivals (darkorange)
+      return '#9370db'; // balanced (mediumpurple)
+    })
+    .style('opacity', 1.0).style('display', 'block');
+  
+  const totalCircles = allCircles.size();
+  const allCirclesInSVG = g.selectAll('circle').size();
+  console.log('=== CIRCLE UPDATE SUMMARY ===');
+  console.log('Total circles in selection:', totalCircles);
+  console.log('Total circles in SVG DOM:', allCirclesInSVG);
+  console.log('Stations with traffic:', stationsWithTraffic.length);
+  
+  if (stationsWithTraffic.length > 0 && totalCircles > 0) {
+    const sample = stationsWithTraffic[0];
+    const samplePos = projection([+sample.lon, +sample.lat]);
+    console.log('Sample station projection:', {
+      name: sample.name,
+      lon: sample.lon,
+      lat: sample.lat,
+      projectedX: samplePos[0],
+      projectedY: samplePos[1],
+      canvasSize: { w: map.getCanvas().offsetWidth, h: map.getCanvas().offsetHeight },
+      isVisible: samplePos[0] >= 0 && samplePos[0] <= map.getCanvas().offsetWidth && 
+                 samplePos[1] >= 0 && samplePos[1] <= map.getCanvas().offsetHeight
+    });
+    
+    // Verify first circle is actually in DOM
+    const firstCircle = g.select('circle.station').node();
+    if (firstCircle) {
+      const cx = firstCircle.getAttribute('cx');
+      const cy = firstCircle.getAttribute('cy');
+      console.log('First circle in DOM:', {
+        cx: cx,
+        cy: cy,
+        r: firstCircle.getAttribute('r'),
+        fill: firstCircle.style.fill || firstCircle.getAttribute('fill'),
+        computedStyle: window.getComputedStyle(firstCircle).fill
+      });
+      
+      // Check if it's visible
+      if (cx && cy && !isNaN(+cx) && !isNaN(+cy)) {
+        console.log('Circle position check:', {
+          x: +cx,
+          y: +cy,
+          inBounds: +cx >= 0 && +cx <= map.getCanvas().offsetWidth && 
+                   +cy >= 0 && +cy <= map.getCanvas().offsetHeight
+        });
+      }
+    } else {
+      console.error('❌ No circles found in DOM!');
+      console.log('Available circles in SVG:', g.selectAll('circle').nodes().map(n => ({
+        tag: n.tagName,
+        fill: n.style.fill,
+        cx: n.getAttribute('cx'),
+        cy: n.getAttribute('cy')
+      })));
+    }
+  } else {
+    console.warn('⚠️ No stations with traffic or no circles created!');
+  }
+  console.log('============================');
+}
+
+// Update circle positions when map moves
+function updateCirclePositions() {
+  if (!g) return;
+  
+  const projection = getProjection();
+  
+  g.selectAll('circle')
+    .each(function(d) {
+      if (d && d.lon && d.lat) {
+        const pos = projection([d.lon, d.lat]);
+        if (!isNaN(pos[0]) && !isNaN(pos[1])) {
+          d3.select(this)
+            .attr('cx', pos[0])
+            .attr('cy', pos[1]);
+        }
+      }
+    });
+}
+
+// Step 5: Set up time filter slider
+function setupTimeFilter() {
+  const slider = d3.select('#time-slider');
+  
+  // Set initial time display
+  const initialValue = +slider.property('value');
+  const initialHours = Math.floor(initialValue / 60);
+  const initialMinutes = initialValue % 60;
+  const initialTimeString = `${String(initialHours).padStart(2, '0')}:${String(initialMinutes).padStart(2, '0')}`;
+  d3.select('#time-display').text(initialTimeString);
+  
+  slider.on('input', function() {
+    const value = +this.value;
+    const hours = Math.floor(value / 60);
+    const minutes = value % 60;
+    const timeString = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+    
+    d3.select('#time-display').text(timeString);
+    
+    // Filter with 2-hour window
+    const windowSize = 120; // 2 hours in minutes
+    const minMinute = (value - windowSize / 2 + 1440) % 1440;
+    const maxMinute = (value + windowSize / 2) % 1440;
+    
+    updateScatterPlot([minMinute, maxMinute]);
+  });
+}
+
+// Update SVG on map interactions
+map.on('move', () => {
+  if (svg) {
+    const mapContainer = d3.select('#map');
+    svg.attr('width', mapContainer.node().offsetWidth)
+       .attr('height', mapContainer.node().offsetHeight);
+  }
+  updateCirclePositions();
+});
+
+map.on('zoom', () => {
+  if (svg) {
+    const mapContainer = d3.select('#map');
+    svg.attr('width', mapContainer.node().offsetWidth)
+       .attr('height', mapContainer.node().offsetHeight);
+  }
+  updateCirclePositions();
+});
+
+map.on('resize', () => {
+  if (svg) {
+    const mapContainer = d3.select('#map');
+    svg.attr('width', mapContainer.node().offsetWidth)
+       .attr('height', mapContainer.node().offsetHeight);
+  }
+  updateCirclePositions();
+});
